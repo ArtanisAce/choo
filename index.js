@@ -16,9 +16,11 @@ module.exports = choo
 function choo (opts) {
   opts = opts || {}
 
-  const _store = barracks(xtend(opts, { onState: render }))
+  const _store = start._store = barracks(xtend(opts, { onState: render }))
+  start._router = null
+  var _defaultRoute = null
   var _rootNode = null
-  var _router = null
+  var _routes = null
 
   start.toString = toString
   start.router = router
@@ -35,7 +37,8 @@ function choo (opts) {
     assert.equal(typeof serverState, 'object', 'choo.app.toString: serverState must be an object')
     _store.start({ noSubscriptions: true, noReducers: true, noEffects: true })
     const state = _store.state({ state: serverState })
-    const tree = _router(route, state, function () {
+    const router = createRouter(_defaultRoute, _routes)
+    const tree = router(route, state, function () {
       assert.fail('choo: send() cannot be called from Node')
     })
     return tree.toString()
@@ -52,18 +55,18 @@ function choo (opts) {
 
     _store.model(appInit(startOpts))
     const createSend = _store.start(startOpts)
-    const send = createSend('view')
+    const router = createRouter(_defaultRoute, _routes, createSend)
     const state = _store.state()
 
     if (!selector) {
-      const tree = _router(state.app.location, state, send)
+      const tree = router(state.app.location, state, null)
       _rootNode = tree
       return tree
     } else {
       document.addEventListener('DOMContentLoaded', function (event) {
         const oldTree = document.querySelector(selector)
         assert.ok(oldTree, 'could not query selector: ' + selector)
-        const newTree = _router(state.app.location, state, send)
+        const newTree = router(state.app.location, state, null)
         _rootNode = yo.update(oldTree, newTree)
       })
     }
@@ -76,16 +79,15 @@ function choo (opts) {
     if (state === prev) return
 
     // note(yw): only here till sheet-router supports custom constructors
-    const send = createSend('view')
-    const newTree = _router(state.app.location, state, send, prev)
+    const newTree = router(state.app.location, state, prev)
     _rootNode = yo.update(_rootNode, newTree)
   }
 
   // register all routes on the router
   // (str?, [fn|[fn]]) -> obj
-  function router (defaultRoute, cb) {
-    _router = sheetRouter(defaultRoute, cb)
-    return _router
+  function router (defaultRoute, routes) {
+    _defaultRoute = defaultRoute
+    _routes = routes
   }
 
   // create a new model
@@ -93,16 +95,41 @@ function choo (opts) {
   function model (model) {
     _store.model(model)
   }
+
+  // create a new router with a custom `createRoute()` function
+  // (str?, obj, fn?) -> null
+  function createRouter (defaultRoute, routes, createSend) {
+    start._router = sheetRouter(defaultRoute, routes, createRoute)
+    var prev = {}
+
+    function createRoute (routeFn) {
+      return function (route, inline, child) {
+        if (!child) inline = wrap(inline, route)
+        else child = wrap(child, route)
+        return routeFn(route, inline, child)
+      }
+
+      function wrap (child, route) {
+        const send = createSend(route)
+        return function wrap (params, state) {
+          const nwPrev = prev
+          const nwState = prev = xtend(state, { params: params })
+          if (!opts.noFreeze) Object.freeze(nwState)
+          return child(nwState, nwPrev, send)
+        }
+      }
+    }
+  }
 }
 
 // initial application state model
 // obj -> obj
 function appInit (opts) {
   const loc = document.location
-  const state = { location: (opts.hash) ? hashMatch(loc.hash) : loc.href }
+  const state = { pathname: (opts.hash) ? hashMatch(loc.hash) : loc.href }
   const reducers = {
-    location: function setLocation (action, state) {
-      return { location: action.location.replace(/#.*/, '') }
+    setLocation: function setLocation (action, state) {
+      return { pathname: action.pathname.replace(/#.*/, '') }
     }
   }
   // if hash routing explicitly enabled, subscribe to it
@@ -114,12 +141,12 @@ function appInit (opts) {
       })
     }, 'handleHash', subs)
   } else {
-    if (opts.history !== false) pushLocationSub(history, 'setLocation', subs)
+    if (opts.history !== false) pushLocationSub(history, 'handleHistory', subs)
     if (opts.href !== false) pushLocationSub(href, 'handleHref', subs)
   }
 
   return {
-    namespace: 'app',
+    namespace: 'location',
     subscriptions: subs,
     reducers: reducers,
     state: state
@@ -131,7 +158,7 @@ function appInit (opts) {
   function pushLocationSub (cb, key, model) {
     model[key] = function (send) {
       cb(function navigate (href) {
-        send('app:location', { location: href })
+        send('location:setLocation', { location: href })
       })
     }
   }
